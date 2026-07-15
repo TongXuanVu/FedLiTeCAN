@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+checkpoints_iov/
+*.pth
+metrics_iov.csv
+metrics_iov_per_client.json
+federated_metrics_round_*.json
+federated_results/
+client_*_partition_indices.txt
