@@ -10,6 +10,7 @@ Dat --max-samples 0 de dung toan bo du lieu.
 """
 import argparse
 import logging
+import os
 import time
 from collections import Counter, OrderedDict
 from typing import Dict, List, Tuple
@@ -55,19 +56,36 @@ def subsample_capped(x: np.ndarray, y: np.ndarray, max_samples: int, seed=42):
 
 class FlowerClient(fl.client.NumPyClient):
     def __init__(self, client_id: int, data_dir: str, device: torch.device,
-                 max_samples: int, batch_size: int):
+                 max_samples: int, batch_size: int, task: int = None):
         self.client_id = client_id
         self.device = device
+        self.task = task
 
         # ----- Load data -----
         path = f"{data_dir}/client_{client_id}.pt"
+        if task is not None:
+            # Che do task-incremental: chi nap du lieu cua DUNG task nay, khong
+            # gop cac task truoc. FedLiTeCAN khong co replay/KD nen day chinh la
+            # dieu kien de do muc do quen thang khi khong ho tro IL.
+            path = f"{data_dir}/client_{client_id}_task_{task + 1}.pt"
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Client {client_id} khong co du lieu cho task {task}: {path}")
         blob = torch.load(path, map_location="cpu", weights_only=False)
-        x = blob["x"].to(torch.float32).numpy()
+        # Doc float16, CHI ep sang float32 SAU KHI subsample. Ban cu ep truoc nen
+        # voi client 29 trieu mau se ton 3,6 GB float32 + 3 ban copy cua
+        # train_test_split -> OOM khi chay --max-samples 0. Ket qua khong doi.
+        x = blob["x"].numpy()
         y = blob["y"].numpy().astype(np.int64)
         logger.info(f"Client {client_id}: loaded {path} x={x.shape} classes={dict(sorted(Counter(y.tolist()).items()))}")
 
         x, y = subsample_capped(x, y, max_samples)
         logger.info(f"Client {client_id}: after subsample n={len(y)}")
+        # Giu float16 khi khong cat tran (>5 trieu mau), ep float32 theo tung
+        # batch trong fit()/evaluate(). Duoi nguong do thi ep het cho nhanh.
+        if len(y) <= 5_000_000:
+            x = x.astype(np.float32)
+        logger.info(f"Client {client_id}: dtype dac trung = {x.dtype}")
 
         # ----- Split 60/20/20 (stratify neu duoc) -----
         try:
@@ -120,7 +138,7 @@ class FlowerClient(fl.client.NumPyClient):
         for epoch in range(epochs):
             running, correct, total = 0.0, 0, 0
             for xb, yb in self.train_loader:
-                xb, yb = xb.to(self.device), yb.to(self.device)
+                xb, yb = xb.to(self.device).float(), yb.to(self.device)
                 self.optimizer.zero_grad()
                 out = self.model(xb)
                 loss = self.criterion(out, yb)
@@ -141,17 +159,20 @@ class FlowerClient(fl.client.NumPyClient):
         self.set_parameters(parameters)
         self.model.eval()
         loss_sum, correct, total = 0.0, 0, 0
-        preds, targs = [], []
+        pbuf, tbuf = [], []
         with torch.no_grad():
             for xb, yb in self.test_loader:
-                xb, yb = xb.to(self.device), yb.to(self.device)
+                xb, yb = xb.to(self.device).float(), yb.to(self.device)
                 out = self.model(xb)
                 loss_sum += self.criterion(out, yb).item()
                 p = out.argmax(1)
                 correct += (p == yb).sum().item()
                 total += yb.size(0)
-                preds.extend(p.cpu().numpy())
-                targs.extend(yb.cpu().numpy())
+                pbuf.append(p.cpu().numpy().astype(np.int16))
+                tbuf.append(yb.cpu().numpy().astype(np.int16))
+        preds = np.concatenate(pbuf)
+        targs = np.concatenate(tbuf)
+        del pbuf, tbuf
         test_loss = loss_sum / len(self.test_loader)
         acc = correct / total
         bal_acc = balanced_accuracy_score(targs, preds)
@@ -184,6 +205,9 @@ def main():
     parser.add_argument("--max-samples", type=int, default=500_000,
                         help="Gioi han so mau moi client (0 = dung het)")
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--task", type=int, default=None, choices=range(5),
+                        help="Che do task-incremental: chi nap client_<i>_task_<task+1>.pt. "
+                             "Bo qua = gop het cac task (client_<i>.pt)")
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -192,7 +216,7 @@ def main():
     logger.info(f"Device: {device}")
 
     client = FlowerClient(args.client_id, args.data_dir, device,
-                          args.max_samples, args.batch_size)
+                          args.max_samples, args.batch_size, args.task)
 
     for attempt in range(3):
         try:

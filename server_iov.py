@@ -71,17 +71,39 @@ def append_csv_row(path: str, row: List):
         w.writerow(row)
 
 
-def load_global_test(test_file: str, max_samples: int):
-    """Nap global_test_data.pt, subsample (giu tron lop thieu so)."""
+# Chia task giong AFSIC-IoV, de so sanh cong bang: [3, 3, 3, 2, 2] lop moi task.
+TASK_INCREMENTS = [3, 3, 3, 2, 2]
+
+
+def learned_classes(task: int) -> int:
+    """So lop da hoc tinh den het task nay (0-indexed)."""
+    return sum(TASK_INCREMENTS[:task + 1])
+
+
+def load_global_test(test_file: str, max_samples: int, task: int = None):
+    """Nap global_test_data.pt, subsample (giu tron lop thieu so).
+
+    task khac None -> loc test set ve cac lop DA HOC (0..learned_classes-1),
+    dung quy uoc voi trainer cua AFSIC-IoV nen hai ben so sanh duoc.
+    """
     logger.info(f"Loading global test set: {test_file}")
     blob = torch.load(test_file, map_location="cpu", weights_only=False)
     x = blob["x"].numpy()                      # float16, khong copy
     y = blob["y"].numpy().astype(np.int64)
     del blob
     logger.info(f"Global test: n={len(y)}, classes={dict(sorted(Counter(y.tolist()).items()))}")
+    if task is not None:
+        n_cls = learned_classes(task)
+        keep = y < n_cls
+        x, y = x[keep], y[keep]
+        logger.info(f"Task {task}: loc test ve lop 0-{n_cls - 1} -> n={len(y)}")
     x, y = subsample_capped(x, y, max_samples)
-    x = x.astype(np.float32)
-    logger.info(f"Evaluating each round on n={len(y)} samples")
+    # Giu float16 khi max_samples = 0 (toan bo 42 trieu mau): ep sang float32 se
+    # ton 5,2 GB thay vi 2,6 GB. Ep sang float32 theo tung batch trong
+    # evaluate_on_global_test, ket qua khong doi.
+    if max_samples != 0:
+        x = x.astype(np.float32)
+    logger.info(f"Evaluating each round on n={len(y)} samples (dtype={x.dtype})")
     loader = DataLoader(TensorDataset(torch.from_numpy(x), torch.from_numpy(y)),
                         batch_size=4096, shuffle=False)
     return loader, y
@@ -100,18 +122,24 @@ def evaluate_on_global_test(model, loader, criterion, device) -> Dict[str, float
     """Tinh du 11 metric tren global test set."""
     model.eval()
     loss_sum, n_batches, correct, total = 0.0, 0, 0, 0
-    preds, targs = [], []
+    # Gom vao list cac mang numpy roi concatenate mot lan. Ban cu dung
+    # list.extend() nen voi 42 trieu mau se tao list Python 42 trieu phan tu
+    # (~3 GB moi list) va OOM. Ket qua tinh ra hoan toan khong doi.
+    preds_buf, targs_buf = [], []
     with torch.no_grad():
         for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
+            xb, yb = xb.to(device).float(), yb.to(device)
             out = model(xb)
             loss_sum += criterion(out, yb).item()
             n_batches += 1
             p = out.argmax(1)
             correct += (p == yb).sum().item()
             total += yb.size(0)
-            preds.extend(p.cpu().numpy())
-            targs.extend(yb.cpu().numpy())
+            preds_buf.append(p.cpu().numpy().astype(np.int16))
+            targs_buf.append(yb.cpu().numpy().astype(np.int16))
+    preds = np.concatenate(preds_buf)
+    targs = np.concatenate(targs_buf)
+    del preds_buf, targs_buf
     metrics = {"loss": loss_sum / n_batches, "accuracy": correct / total}
     for avg in ("micro", "macro", "weighted"):
         prec, rec, f1, _ = precision_recall_fscore_support(
@@ -185,6 +213,9 @@ def main():
     parser.add_argument("--test-file", type=str, default=DEFAULT_TEST)
     parser.add_argument("--test-max-samples", type=int, default=1_000_000,
                         help="So mau global test dung moi round (0 = het 42M, cham)")
+    parser.add_argument("--task", type=int, default=None, choices=range(5),
+                        help="Che do task-incremental: danh gia tren cac lop DA HOC "
+                             "(0-2, 0-5, 0-8, 0-10, 0-12). Bo qua = danh gia ca 13 lop")
     args = parser.parse_args()
 
     if args.mode in ("resume", "test") and not args.checkpoint:
@@ -201,7 +232,12 @@ def main():
         logger.info(f"Loaded checkpoint '{args.checkpoint}' (round {start_round})")
 
     # Nap global test 1 lan duy nhat
-    test_loader, y_test = load_global_test(args.test_file, args.test_max_samples)
+    test_loader, y_test = load_global_test(args.test_file, args.test_max_samples, args.task)
+    if args.task is not None:
+        n_cls = learned_classes(args.task)
+        p_max = np.bincount(y_test, minlength=n_cls)[:n_cls].max() / len(y_test)
+        logger.info(f"Task {args.task}: {n_cls} lop | lop da so chiem {p_max * 100:.2f}% | "
+                    f"NGUONG SUP macro-F1 = {2 * p_max / (n_cls * (1 + p_max)) * 100:.2f}%")
     criterion = make_criterion(y_test, device)
     model.to(device)
 
